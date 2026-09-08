@@ -2,171 +2,177 @@
 
 This module owns the decision. It does not know it was reached over HTTP, which
 is why it can be tested by calling a function with a typed object and asserting on
-the result with no server running. It does not know where notifications are
-stored either. It knows the rules.
+the result with no server running.
 
-`evaluate_policy_exists` ships written. It is the pattern every other rule
-follows: take the notification and whatever it needs, decide, and return a
-`ValidationOutcome` that names the rule and carries the values the decision was
-made on. Nothing prints, nothing raises for an ordinary refusal, and nothing
-reaches for a status code, because a status code is a fact about HTTP and this
-module does not know about HTTP.
+`evaluate_notification` is the decision. It takes a notification and a policy and
+returns `RuleFailure | None`. It has no side effects and touches nothing outside
+itself: no client, no repository, no write. A `None` means every policy-field
+rule passed. A `RuleFailure` names the first one that did not.
 
-Day 3 assignment. Build the remaining rules test-first against
-`docs/api-contract.md` section 4.
+`submit_notification` is the orchestration. It resolves the policy through the
+client, evaluates, and records only if evaluation passed. Two things the client
+can raise are not the same condition and are not handled the same way.
+`PolicyNotFound` means the master answered and said no: that is V-1, and it
+becomes a `RuleFailure` like any other rule outcome. `PolicyLookupFailed` means
+you do not know. That is not a rule outcome. It is not caught here, so it
+reaches the HTTP layer intact and tomorrow's routes can map its `reason` to the
+status in contract section 6.
+
+Day 3 assignment. Build the remaining rules against `docs/api-contract.md`
+section 4.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from collections.abc import Callable
 
-from claims.models import NotificationRequest, Policy, RecordedNotification
+from claims.models import (
+    NotificationRequest,
+    Policy,
+    RecordedNotification,
+    RuleFailure,
+)
 from claims.policy_client import PolicyClient, PolicyNotFound
 from claims.repository import NotificationRepository
-
-
-@dataclass(frozen=True)
-class ValidationOutcome:
-    """The result of evaluating one rule, or of evaluating them all.
-
-    `passed` is the only thing a caller has to branch on. When it is false, `rule`
-    names the rule that decided it, `code` is the stable contract code, and
-    `detail` carries the values that produced the decision so that the person
-    reading the eventual error can see which input was wrong.
-
-    There is no status code here. Contract section 6 maps a code to a status, and
-    that mapping is applied at the HTTP boundary.
-    """
-
-    passed: bool
-    rule: str | None = None
-    code: str | None = None
-    detail: dict[str, Any] = field(default_factory=dict)
-
-    @classmethod
-    def ok(cls) -> ValidationOutcome:
-        return cls(passed=True)
-
-    @classmethod
-    def failed(cls, rule: str, code: str, **detail: Any) -> ValidationOutcome:
-        return cls(passed=False, rule=rule, code=code, detail=detail)
-
-
-def evaluate_policy_exists(
-    notification: NotificationRequest,
-    policy_client: PolicyClient,
-) -> ValidationOutcome:
-    """V-1. The policy must exist in the policy master.
-
-    This rule is different from the others in one way that matters: it is the only
-    one that reaches outside the service, so it is the only one that can fail for
-    a reason that is not the caller's fault. `PolicyNotFound` is caught here and
-    turned into an ordinary refusal, because a policy that does not exist is a
-    fact about the caller's data. `PolicyLookupFailed` is deliberately not caught,
-    because the caller did nothing wrong and the HTTP layer has to be able to tell
-    the two apart. Contract section 6 fixes what each becomes.
-
-    V-1 short circuits. Every other rule compares against a field on a policy, and
-    if there is no policy there is nothing to compare against. Reporting
-    LOSS_BEFORE_INCEPTION for a policy number that does not exist is not merely
-    unhelpful, it is a false statement about the client's data (WI-0142, AC-4).
-    """
-    try:
-        policy_client.get_policy(notification.policy_number)
-    except PolicyNotFound:
-        return ValidationOutcome.failed(
-            rule="V-1",
-            code="POLICY_NOT_FOUND",
-            policy_number=notification.policy_number,
-        )
-    return ValidationOutcome.ok()
-
-
-def _not_yet_implemented() -> ValidationOutcome:
-    """Placeholder so tests fail on assertions, not ImportError or NotImplementedError."""
-    return ValidationOutcome.failed(rule="STUB", code="NOT_IMPLEMENTED")
 
 
 def evaluate_loss_after_inception(
     notification: NotificationRequest,
     policy: Policy,
-) -> ValidationOutcome:
+) -> RuleFailure | None:
     """V-2. The loss must not precede policy inception.
 
     The boundary is stated in contract section 4.2 and in WI-0142 AC-3. A loss on
     the inception date is covered.
     """
-    return _not_yet_implemented()
+    if notification.loss_date >= policy.effective_date:
+        return None
+    return RuleFailure(rule="V-2", code="LOSS_BEFORE_INCEPTION")
 
 
 def evaluate_loss_before_expiry(
     notification: NotificationRequest,
     policy: Policy,
-) -> ValidationOutcome:
+) -> RuleFailure | None:
     """V-3. The loss must not fall after the policy expiry date."""
-    return _not_yet_implemented()
+    if notification.loss_date <= policy.expiry_date:
+        return None
+    return RuleFailure(rule="V-3", code="LOSS_AFTER_EXPIRY")
 
 
 def evaluate_amount_within_limit(
     notification: NotificationRequest,
     policy: Policy,
-) -> ValidationOutcome:
+) -> RuleFailure | None:
     """V-4. The estimated amount must not exceed the policy limit.
 
     An amount equal to the limit is within cover, per contract section 4.2.
     """
-    return _not_yet_implemented()
+    if notification.estimated_amount <= policy.limit:
+        return None
+    return RuleFailure(rule="V-4", code="AMOUNT_EXCEEDS_LIMIT")
 
 
 def evaluate_claim_type_covered(
     notification: NotificationRequest,
     policy: Policy,
-) -> ValidationOutcome:
+) -> RuleFailure | None:
     """V-5. The claim type must be permitted on the policy's product."""
-    return _not_yet_implemented()
+    if notification.claim_type in policy.permitted_claim_types:
+        return None
+    return RuleFailure(rule="V-5", code="TYPE_NOT_COVERED")
 
 
 def evaluate_duplicate_notification(
     notification: NotificationRequest,
     repository: NotificationRepository,
-) -> ValidationOutcome:
-    """V-6. The notification must not duplicate a recorded loss event."""
-    return _not_yet_implemented()
+) -> RuleFailure | None:
+    """V-6. The notification must not duplicate a recorded loss event.
+
+    This is a query against what has been recorded, not a comparison to a policy
+    field, which is why it is not called from `evaluate_notification`.
+    """
+    existing = repository.find_matching(
+        notification.policy_number,
+        notification.loss_date,
+        notification.claim_type,
+    )
+    if existing is None:
+        return None
+    return RuleFailure(rule="V-6", code="DUPLICATE_NOTIFICATION")
 
 
 def evaluate_loss_before_cancellation(
     notification: NotificationRequest,
     policy: Policy,
-) -> ValidationOutcome:
+) -> RuleFailure | None:
     """V-7. Cover has ended when cancellation_date is set and the loss is on or after it."""
-    return _not_yet_implemented()
+    if policy.cancellation_date is None:
+        return None
+    if notification.loss_date < policy.cancellation_date:
+        return None
+    return RuleFailure(rule="V-7", code="POLICY_CANCELLED")
+
+
+PolicyRule = Callable[[NotificationRequest, Policy], RuleFailure | None]
+
+# Pure functions of (notification, policy), in section 4.1 order among themselves.
+# V-1 is not listed: it is PolicyNotFound at the client boundary in submit.
+# V-6 is not listed: it is a repository query, also in submit.
+POLICY_RULES: tuple[PolicyRule, ...] = (
+    evaluate_loss_before_cancellation,  # V-7
+    evaluate_loss_after_inception,  # V-2
+    evaluate_loss_before_expiry,  # V-3
+    evaluate_claim_type_covered,  # V-5
+    evaluate_amount_within_limit,  # V-4
+)
 
 
 def evaluate_notification(
     notification: NotificationRequest,
-    policy_client: PolicyClient,
-    repository: NotificationRepository,
-) -> ValidationOutcome:
-    """Evaluate every rule and return the outcome the caller sees.
+    policy: Policy,
+) -> RuleFailure | None:
+    """Return the first policy-field rule that fails, or None.
 
     A notification can violate several rules at once and the caller sees one
     reason, so the order this function evaluates in is a caller-visible behavior.
-    It is fixed by contract section 4.1 and by nothing else. If you find yourself
-    choosing an order here, the contract is incomplete and the fix belongs there.
+    It is fixed by contract section 4.1 among the rules that read a policy field:
+    V-7, V-2, V-3, V-5, V-4. V-1 and V-6 do not belong here. V-1 is a fact about
+    the lookup, and V-6 is a fact about the store.
     """
-    return _not_yet_implemented()
+    for rule in POLICY_RULES:
+        failure = rule(notification, policy)
+        if failure is not None:
+            return failure
+    return None
 
 
 def submit_notification(
     notification: NotificationRequest,
     policy_client: PolicyClient,
     repository: NotificationRepository,
-) -> RecordedNotification | ValidationOutcome:
-    """Validate, and record only if every rule passed.
+) -> RecordedNotification | RuleFailure:
+    """Resolve the policy, evaluate, and record only if every rule passed.
 
-    Nothing is written before the decision is made. A notification is either
-    recorded with a claim reference or it does not exist, and there is no state in
-    between for a later reader to interpret.
+    `PolicyNotFound` is V-1. `PolicyLookupFailed` is not caught: this function
+    cannot answer it, and the HTTP layer has to see the `reason`.
+
+    V-6 sits between V-7 and V-2 (section 4.1). It cannot run inside
+    `evaluate_notification`, so V-7 is checked here first, then the store, then
+    the remaining coverage rules. Running V-7 first also means a cancelled
+    policy that is also after expiry reports POLICY_CANCELLED (WI-0158 AC-4).
     """
-    return _not_yet_implemented()
+    try:
+        record = policy_client.get_policy(notification.policy_number)
+    except PolicyNotFound:
+        return RuleFailure(rule="V-1", code="POLICY_NOT_FOUND")
+
+    policy = Policy.from_record(record)
+
+    if failure := evaluate_loss_before_cancellation(notification, policy):
+        return failure
+    if failure := evaluate_duplicate_notification(notification, repository):
+        return failure
+    if failure := evaluate_notification(notification, policy):
+        return failure
+    return repository.record(notification)

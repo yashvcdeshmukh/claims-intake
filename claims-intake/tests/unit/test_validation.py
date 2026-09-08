@@ -1,6 +1,6 @@
 """One parametrized test per rule in contract section 4.
 
-Assertions are on ValidationOutcome. HTTP status is section 6 and is not this
+Assertions are on RuleFailure | None. HTTP status is section 6 and is not this
 layer. Cases use contract vocabulary and the work-item criteria they protect.
 """
 
@@ -11,11 +11,10 @@ from decimal import Decimal
 
 import pytest
 
-from claims.models import ClaimRecord, NotificationRequest, Policy
+from claims.models import ClaimRecord, NotificationRequest, Policy, RuleFailure
 from claims.policy_client import PolicyLookupFailed, StubPolicyClient
 from claims.repository import NotificationRepository
 from claims.service import (
-    ValidationOutcome,
     evaluate_amount_within_limit,
     evaluate_claim_type_covered,
     evaluate_duplicate_notification,
@@ -23,7 +22,6 @@ from claims.service import (
     evaluate_loss_before_cancellation,
     evaluate_loss_before_expiry,
     evaluate_notification,
-    evaluate_policy_exists,
     submit_notification,
 )
 
@@ -82,29 +80,45 @@ def repository() -> NotificationRepository:
         ),
     ],
 )
-def test_v1_policy_exists(
+def test_v1_policy_exists_is_decided_at_the_client_boundary(
     policy_client: StubPolicyClient,
+    repository: NotificationRepository,
     policy_number: str,
     expect_pass: bool,
     expect_code: str | None,
 ) -> None:
     notification = make_notification(policy_number=policy_number)
-    outcome = evaluate_policy_exists(notification, policy_client)
-    assert outcome.passed is expect_pass
+    result = submit_notification(notification, policy_client, repository)
     if expect_pass:
+        assert isinstance(result, ClaimRecord)
         return
-    assert outcome.rule == "V-1"
-    assert outcome.code == expect_code
-    assert outcome.detail["policy_number"] == policy_number
+    assert expect_code is not None
+    assert result == RuleFailure(rule="V-1", code=expect_code)
+    assert (
+        repository.find_matching(
+            notification.policy_number,
+            notification.loss_date,
+            notification.claim_type,
+        )
+        is None
+    )
 
 
 def test_v1_policy_lookup_failed_is_not_a_rule_refusal(
     policy_client: StubPolicyClient,
+    repository: NotificationRepository,
 ) -> None:
     policy_client.fail_with = "timeout"
     with pytest.raises(PolicyLookupFailed) as raised:
-        evaluate_policy_exists(make_notification(policy_number="MOT-4471"), policy_client)
+        submit_notification(
+            make_notification(policy_number="MOT-4471"),
+            policy_client,
+            repository,
+        )
     assert raised.value.reason == "timeout"
+    assert (
+        repository.find_matching("MOT-4471", date(2026, 4, 2), "collision") is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -118,14 +132,11 @@ def test_v1_policy_lookup_failed_is_not_a_rule_refusal(
 def test_v2_loss_after_inception(loss_date: date, expect_pass: bool) -> None:
     notification = make_notification(loss_date=loss_date)
     policy = make_policy()
-    outcome = evaluate_loss_after_inception(notification, policy)
-    assert outcome.passed is expect_pass
+    failure = evaluate_loss_after_inception(notification, policy)
     if expect_pass:
+        assert failure is None
         return
-    assert outcome.rule == "V-2"
-    assert outcome.code == "LOSS_BEFORE_INCEPTION"
-    assert outcome.detail["loss_date"] == loss_date
-    assert outcome.detail["effective_date"] == EFFECTIVE
+    assert failure == RuleFailure(rule="V-2", code="LOSS_BEFORE_INCEPTION")
 
 
 @pytest.mark.parametrize(
@@ -139,14 +150,11 @@ def test_v2_loss_after_inception(loss_date: date, expect_pass: bool) -> None:
 def test_v3_loss_before_expiry(loss_date: date, expect_pass: bool) -> None:
     notification = make_notification(loss_date=loss_date)
     policy = make_policy()
-    outcome = evaluate_loss_before_expiry(notification, policy)
-    assert outcome.passed is expect_pass
+    failure = evaluate_loss_before_expiry(notification, policy)
     if expect_pass:
+        assert failure is None
         return
-    assert outcome.rule == "V-3"
-    assert outcome.code == "LOSS_AFTER_EXPIRY"
-    assert outcome.detail["loss_date"] == loss_date
-    assert outcome.detail["expiry_date"] == EXPIRY
+    assert failure == RuleFailure(rule="V-3", code="LOSS_AFTER_EXPIRY")
 
 
 @pytest.mark.parametrize(
@@ -160,14 +168,11 @@ def test_v3_loss_before_expiry(loss_date: date, expect_pass: bool) -> None:
 def test_v4_amount_within_limit(amount: Decimal, expect_pass: bool) -> None:
     notification = make_notification(estimated_amount=amount)
     policy = make_policy()
-    outcome = evaluate_amount_within_limit(notification, policy)
-    assert outcome.passed is expect_pass
+    failure = evaluate_amount_within_limit(notification, policy)
     if expect_pass:
+        assert failure is None
         return
-    assert outcome.rule == "V-4"
-    assert outcome.code == "AMOUNT_EXCEEDS_LIMIT"
-    assert outcome.detail["estimated_amount"] == amount
-    assert outcome.detail["limit"] == LIMIT
+    assert failure == RuleFailure(rule="V-4", code="AMOUNT_EXCEEDS_LIMIT")
 
 
 @pytest.mark.parametrize(
@@ -190,14 +195,11 @@ def test_v5_claim_type_covered(
 ) -> None:
     notification = make_notification(claim_type=claim_type)
     policy = make_policy(permitted_claim_types=permitted)
-    outcome = evaluate_claim_type_covered(notification, policy)
-    assert outcome.passed is expect_pass
+    failure = evaluate_claim_type_covered(notification, policy)
     if expect_pass:
+        assert failure is None
         return
-    assert outcome.rule == "V-5"
-    assert outcome.code == "TYPE_NOT_COVERED"
-    assert outcome.detail["claim_type"] == claim_type
-    assert outcome.detail["permitted_claim_types"] == permitted
+    assert failure == RuleFailure(rule="V-5", code="TYPE_NOT_COVERED")
 
 
 @pytest.mark.parametrize(
@@ -218,21 +220,13 @@ def test_v6_duplicate_notification(
 ) -> None:
     first = make_notification()
     if record_first:
-        recorded = repository.record(first)
-    else:
-        recorded = None
+        repository.record(first)
     second = make_notification(**second_overrides)
-    outcome = evaluate_duplicate_notification(second, repository)
-    assert outcome.passed is expect_pass
+    failure = evaluate_duplicate_notification(second, repository)
     if expect_pass:
+        assert failure is None
         return
-    assert recorded is not None
-    assert outcome.rule == "V-6"
-    assert outcome.code == "DUPLICATE_NOTIFICATION"
-    assert outcome.detail["policy_number"] == second.policy_number
-    assert outcome.detail["loss_date"] == second.loss_date
-    assert outcome.detail["claim_type"] == second.claim_type
-    assert outcome.detail["claim_reference"] == recorded.claim_reference
+    assert failure == RuleFailure(rule="V-6", code="DUPLICATE_NOTIFICATION")
 
 
 @pytest.mark.parametrize(
@@ -266,61 +260,65 @@ def test_v7_loss_before_cancellation(
 ) -> None:
     notification = make_notification(loss_date=loss_date)
     policy = make_policy(cancellation_date=cancellation_date)
-    outcome = evaluate_loss_before_cancellation(notification, policy)
-    assert outcome.passed is expect_pass
+    failure = evaluate_loss_before_cancellation(notification, policy)
     if expect_pass:
+        assert failure is None
         return
-    assert outcome.rule == "V-7"
-    assert outcome.code == "POLICY_CANCELLED"
-    assert outcome.detail["loss_date"] == loss_date
-    assert outcome.detail["cancellation_date"] == cancellation_date
+    assert failure == RuleFailure(rule="V-7", code="POLICY_CANCELLED")
+
+
+def test_evaluate_notification_is_pure_and_reports_cancellation_before_expiry() -> None:
+    notification = make_notification(loss_date=date(2026, 1, 8))
+    policy = make_policy(
+        effective_date=date(2025, 1, 1),
+        expiry_date=date(2025, 12, 31),
+        cancellation_date=date(2025, 10, 1),
+    )
+    failure = evaluate_notification(notification, policy)
+    assert failure == RuleFailure(rule="V-7", code="POLICY_CANCELLED")
 
 
 @pytest.mark.parametrize(
-    ("policy_number", "loss_date", "record_first", "expect_code"),
+    ("policy_number", "loss_date", "record_first", "expect"),
     [
         pytest.param(
             "MOT-9999",
             date(2025, 1, 1),
             False,
-            "POLICY_NOT_FOUND",
+            RuleFailure(rule="V-1", code="POLICY_NOT_FOUND"),
             id="WI-0142_AC-4_not_found_not_inception",
         ),
         pytest.param(
             "MOT-4500",
             date(2026, 1, 8),
             False,
-            "POLICY_CANCELLED",
+            RuleFailure(rule="V-7", code="POLICY_CANCELLED"),
             id="WI-0158_AC-4_cancelled_and_after_expiry",
         ),
         pytest.param(
             "MOT-4471",
             date(2026, 4, 2),
             True,
-            "DUPLICATE_NOTIFICATION",
+            RuleFailure(rule="V-6", code="DUPLICATE_NOTIFICATION"),
             id="duplicate_reported_before_inception_type_or_amount",
         ),
     ],
 )
-def test_evaluate_notification_reports_the_first_failure(
+def test_submit_notification_reports_the_first_failure(
     policy_client: StubPolicyClient,
     repository: NotificationRepository,
     policy_number: str,
     loss_date: date,
     record_first: bool,
-    expect_code: str,
+    expect: RuleFailure,
 ) -> None:
     notification = make_notification(policy_number=policy_number, loss_date=loss_date)
     if record_first:
         repository.record(notification)
-    outcome = evaluate_notification(notification, policy_client, repository)
-    assert outcome.passed is False
-    assert outcome.code == expect_code
-    if expect_code == "POLICY_NOT_FOUND":
-        assert outcome.rule == "V-1"
-    if expect_code == "POLICY_CANCELLED":
-        assert outcome.rule == "V-7"
-        assert outcome.code != "LOSS_AFTER_EXPIRY"
+    result = submit_notification(notification, policy_client, repository)
+    assert result == expect
+    if expect.code == "POLICY_CANCELLED":
+        assert expect.code != "LOSS_AFTER_EXPIRY"
 
 
 @pytest.mark.parametrize(
@@ -359,6 +357,5 @@ def test_submit_notification_records_only_when_every_rule_passes(
         assert found is not None
         assert found.claim_reference == result.claim_reference
         return
-    assert isinstance(result, ValidationOutcome)
+    assert result == RuleFailure(rule="V-2", code="LOSS_BEFORE_INCEPTION")
     assert found is None
-    assert result.passed is False
