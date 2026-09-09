@@ -5,10 +5,6 @@ master and the rule table in `docs/api-contract.md`, and either records a
 notification and issues a claim reference or refuses the submission with a
 specific reason.
 
-This README is incomplete. Completing it is part of the Day 4 lab, and the
-standard it is graded against is that a person who has never seen this repository
-can follow it to a running service.
-
 ## Where things are
 
 | Path | What it holds |
@@ -32,6 +28,17 @@ pwd           # /workspaces/claims-intake
 Dependencies are installed when the container is created. There is no install
 step in any assignment this week. If a tool you need is missing, that is a defect
 in the image specification and should be reported rather than worked around.
+
+## Run the service
+
+```
+uv run uvicorn claims.api.routes:app --reload
+```
+
+The process listens at `http://127.0.0.1:8000`. The only endpoint this service
+defines is `POST /notifications`, specified in `docs/api-contract.md`.
+
+## Run the tests
 
 ```
 uv run pytest
