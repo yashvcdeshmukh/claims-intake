@@ -47,7 +47,7 @@ uv run ruff check .
 uv run mypy
 ```
 
-## Running the service
+## Run with Docker
 
 Build an image from this directory, then start a container that publishes port
 8000:
