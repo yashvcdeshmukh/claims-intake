@@ -39,6 +39,30 @@ uv run uvicorn claims.api.routes:app --reload
 The process listens at `http://127.0.0.1:8000`. The only endpoint this service
 defines is `POST /notifications`, specified in `docs/api-contract.md`.
 
+Confirm it answers. From a second terminal:
+
+```
+curl -i -X POST http://127.0.0.1:8000/notifications \
+  -H 'Content-Type: application/json' \
+  -d '{"policy_number": "MOT-4471",
+       "loss_date": "2026-04-02",
+       "claim_type": "collision",
+       "estimated_amount": "4200.00",
+       "description": "Rear ended at a junction."}'
+```
+
+The first call returns `201` with a claim reference. Send it again and the same
+command returns `409 DUPLICATE_NOTIFICATION` quoting the reference issued the
+first time, because a policy number, loss date, and claim type together identify
+one loss event (rule `V-6`). Change `MOT-4471` to `MOT-9999` and you get `422
+POLICY_NOT_FOUND`. Every code and status is listed in `docs/api-contract.md`
+sections 5 and 6.
+
+Recorded notifications are held in memory. Restarting the process empties the
+store, so a payload that was a duplicate a moment ago is accepted again. The
+policy master is `data/policies.json` read through a stub, so nothing here
+reaches a network.
+
 ## Run the tests
 
 ```
@@ -46,6 +70,11 @@ uv run pytest
 uv run ruff check .
 uv run mypy
 ```
+
+`tests/unit/` mirrors `src/claims/` and calls functions directly. `tests/integration/`
+sends real requests through the ASGI stack and asserts on statuses and bodies.
+These three commands are what the pull-request check runs, so a failure here is
+a failure there.
 
 ## Run with Docker
 
@@ -62,7 +91,8 @@ see it. Without it, `buildx` builds the image and then throws it away.
 
 The process is up when a browser or `curl` against `http://localhost:8000/docs`
 returns FastAPI's OpenAPI page. `http://localhost:8000/openapi.json` is the same
-check as raw JSON.
+check as raw JSON. The container publishes the same port as a local run, so the
+`curl` above works against it unchanged.
 
 ### Why `--platform linux/amd64`
 

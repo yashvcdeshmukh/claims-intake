@@ -1,8 +1,16 @@
 """HTTP tests for POST /notifications.
 
-These exercise the service through the ASGI stack. They do not call submit or
-evaluate functions. Assertions are on status, code, and the promised detail
-keys that make each refusal actionable.
+These exercise the service through the ASGI stack: a request goes in as bytes
+and the assertion is on the status line and the JSON body. They never call
+`submit_notification` or `evaluate_notification`, because the thing under test
+here is the mapping the contract fixes in sections 5 and 6, not the rules.
+
+Every refusal is checked for the envelope shape section 5 promises and for the
+`detail` keys and values that make it actionable: a handler who reads only this
+response has to know which two facts the service compared.
+
+The app comes from a fixture, so each test gets its own store. A shared store
+would make a duplicate test pass because an earlier test recorded the payload.
 """
 
 from __future__ import annotations
@@ -12,6 +20,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -34,11 +43,6 @@ EDGE = _payloads("fnol_edge.json")
 
 
 @pytest.fixture
-def policy_client() -> StubPolicyClient:
-    return StubPolicyClient()
-
-
-@pytest.fixture
 def repository() -> NotificationRepository:
     return NotificationRepository()
 
@@ -51,12 +55,56 @@ def client(
     return TestClient(create_app(policy_client, repository))
 
 
-def test_accepted_notification_returns_201_with_claim_reference(client: TestClient) -> None:
-    response = client.post("/notifications", json=VALID["VALID-01"])
+def _post(client: TestClient, payload: dict[str, object] | list[object]) -> httpx.Response:
+    response = client.post("/notifications", json=payload)
+    assert isinstance(response, httpx.Response)
+    return response
+
+
+def _body(response: httpx.Response) -> dict[str, Any]:
+    payload = response.json()
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _assert_refusal(
+    response: httpx.Response,
+    *,
+    status: int,
+    code: str,
+    rule: str | None,
+) -> dict[str, Any]:
+    """Assert the section 5 envelope and return the body for detail assertions.
+
+    `rule` is `None` for a refusal no section 4 rule decided. The contract says
+    callers must not require the key, so its absence is asserted rather than
+    tolerated: a `rule` on a parse failure would be a fabricated attribution.
+    """
+
+    assert response.status_code == status
+    body = _body(response)
+    assert body["code"] == code
+    assert isinstance(body["message"], str)
+    assert body["message"]
+    assert isinstance(body["detail"], dict)
+    if rule is None:
+        assert "rule" not in body
+    else:
+        assert body["rule"] == rule
+    assert {"code", "message", "detail"} <= set(body)
+    assert set(body) <= {"code", "rule", "message", "detail"}
+    return body
+
+
+def test_accepted_notification_returns_201_with_a_claim_reference(
+    client: TestClient,
+) -> None:
+    response = _post(client, VALID["VALID-01"])
     assert response.status_code == 201
-    body = response.json()
+    body = _body(response)
     assert body["status"] == "recorded"
     assert CLAIM_REFERENCE.fullmatch(body["claim_reference"])
+    assert set(body) == {"claim_reference", "status"}
 
 
 @pytest.mark.parametrize(
@@ -112,7 +160,7 @@ def test_accepted_notification_returns_201_with_claim_reference(client: TestClie
         ),
     ],
 )
-def test_each_rule_refusal_returns_status_code_and_actionable_detail(
+def test_each_rule_refusal_returns_its_status_code_and_actionable_detail(
     client: TestClient,
     payload_id: str,
     status: int,
@@ -120,41 +168,147 @@ def test_each_rule_refusal_returns_status_code_and_actionable_detail(
     rule: str,
     detail: dict[str, object],
 ) -> None:
-    response = client.post("/notifications", json=INVALID[payload_id])
-    assert response.status_code == status
-    body = response.json()
-    assert body["code"] == code
-    assert body["rule"] == rule
-    for key, value in detail.items():
-        assert body["detail"][key] == value
+    """One case per rule in section 4.2, except V-6, which needs a prior 201.
+
+    `detail` is compared whole. Asserting the exact object covers both halves of
+    the promise in section 5: every key the table promises is present, carrying
+    the value the rule actually compared, and no key the caller was told to
+    ignore has crept in.
+    """
+
+    body = _assert_refusal(
+        _post(client, INVALID[payload_id]),
+        status=status,
+        code=code,
+        rule=rule,
+    )
+    assert body["detail"] == detail
 
 
-def test_duplicate_notification_returns_409_with_existing_claim_reference(
+def test_duplicate_of_a_recorded_notification_returns_409_naming_the_first_reference(
     client: TestClient,
 ) -> None:
-    first = client.post("/notifications", json=VALID["VALID-01"])
+    """V-6. INVALID-06 is the resubmission of VALID-01 after a portal timeout.
+
+    The claim reference in `detail` is the one issued to the first submission.
+    That is the whole value of the refusal: the caller learns the loss is already
+    on file and which reference to quote, instead of retrying.
+    """
+
+    recorded = _post(client, VALID["VALID-01"])
+    assert recorded.status_code == 201
+
+    body = _assert_refusal(
+        _post(client, INVALID["INVALID-06"]),
+        status=409,
+        code="DUPLICATE_NOTIFICATION",
+        rule="V-6",
+    )
+    assert body["detail"] == {
+        "policy_number": "MOT-4471",
+        "loss_date": "2026-04-02",
+        "claim_type": "collision",
+        "claim_reference": _body(recorded)["claim_reference"],
+    }
+
+
+def test_a_notification_is_recorded_once_even_when_the_same_payload_is_sent_twice(
+    client: TestClient,
+) -> None:
+    first = _post(client, VALID["VALID-01"])
+    second = _post(client, VALID["VALID-01"])
     assert first.status_code == 201
-    recorded_reference = first.json()["claim_reference"]
-
-    second = client.post("/notifications", json=INVALID["INVALID-06"])
-    assert second.status_code == 409
-    body = second.json()
-    assert body["code"] == "DUPLICATE_NOTIFICATION"
-    assert body["rule"] == "V-6"
-    assert body["detail"]["policy_number"] == "MOT-4471"
-    assert body["detail"]["loss_date"] == "2026-04-02"
-    assert body["detail"]["claim_type"] == "collision"
-    assert body["detail"]["claim_reference"] == recorded_reference
+    body = _assert_refusal(second, status=409, code="DUPLICATE_NOTIFICATION", rule="V-6")
+    assert body["detail"]["claim_reference"] == _body(first)["claim_reference"]
 
 
-def test_parse_failure_returns_400_malformed_request(client: TestClient) -> None:
-    response = client.post("/notifications", json=EDGE["EDGE-08"])
-    assert response.status_code == 400
-    body = response.json()
-    assert body["code"] == "MALFORMED_REQUEST"
-    assert "rule" not in body
-    assert body["detail"]["issue"] == "missing"
-    assert body["detail"]["field"] == "estimated_amount"
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(b"not json", id="not_json"),
+        pytest.param(b"", id="empty_body"),
+    ],
+)
+def test_a_body_that_is_not_json_is_a_400_with_issue_not_json(
+    client: TestClient,
+    raw: bytes,
+) -> None:
+    """Only reachable over HTTP: a typed call cannot be handed undecodable bytes.
+
+    `field` is absent because no field failed. The body did.
+    """
+
+    response = client.post(
+        "/notifications",
+        content=raw,
+        headers={"Content-Type": "application/json"},
+    )
+    body = _assert_refusal(response, status=400, code="MALFORMED_REQUEST", rule=None)
+    assert body["detail"] == {"issue": "not_json"}
+
+
+@pytest.mark.parametrize(
+    ("payload", "issue", "field"),
+    [
+        pytest.param(EDGE["EDGE-08"], "missing", "estimated_amount", id="EDGE-08_missing_amount"),
+        pytest.param(
+            {**VALID["VALID-01"], "handler_id": "x"},
+            "unknown_field",
+            "handler_id",
+            id="unknown_field",
+        ),
+        pytest.param(
+            EDGE["EDGE-11"],
+            "invalid_value",
+            "claim_type",
+            id="EDGE-11_claim_type_outside_vocabulary",
+        ),
+        pytest.param(
+            EDGE["EDGE-12"],
+            "invalid_value",
+            "estimated_amount",
+            id="EDGE-12_three_decimal_places",
+        ),
+        pytest.param(
+            {**VALID["VALID-01"], "estimated_amount": {"value": "4200.00"}},
+            "wrong_type",
+            "estimated_amount",
+            id="amount_wrong_type",
+        ),
+    ],
+)
+def test_a_payload_the_service_cannot_interpret_is_a_400_naming_the_field(
+    client: TestClient,
+    payload: dict[str, object],
+    issue: str,
+    field: str,
+) -> None:
+    """Section 2.4: the caller's code is wrong, so the response names what to fix.
+
+    EDGE-11 and EDGE-12 are 400 and not 422: a claim type outside the 2.3
+    vocabulary and an amount with three decimal places cannot be interpreted, so
+    they are never evaluated against V-5 or V-4.
+    """
+
+    body = _assert_refusal(
+        _post(client, payload),
+        status=400,
+        code="MALFORMED_REQUEST",
+        rule=None,
+    )
+    assert body["detail"] == {"issue": issue, "field": field}
+
+
+def test_a_json_array_is_a_400_with_no_field_to_name(client: TestClient) -> None:
+    """The body decoded but is not an object, so no single field is at fault."""
+
+    body = _assert_refusal(
+        _post(client, [{"policy_number": "MOT-4471"}]),
+        status=400,
+        code="MALFORMED_REQUEST",
+        rule=None,
+    )
+    assert body["detail"] == {"issue": "wrong_type"}
 
 
 @pytest.mark.parametrize(
@@ -165,17 +319,29 @@ def test_parse_failure_returns_400_malformed_request(client: TestClient) -> None
         pytest.param("unparsable", 502, id="unparsable"),
     ],
 )
-def test_policy_lookup_failed_maps_reason_to_status(
-    policy_client: StubPolicyClient,
+def test_a_policy_master_that_did_not_answer_maps_its_reason_to_a_5xx(
     repository: NotificationRepository,
     reason: LookupFailureReason,
     status: int,
 ) -> None:
-    policy_client.fail_with = reason
-    client = TestClient(create_app(policy_client, repository))
-    response = client.post("/notifications", json=VALID["VALID-01"])
-    assert response.status_code == status
-    body = response.json()
-    assert body["code"] == "POLICY_LOOKUP_FAILED"
-    assert "rule" not in body
-    assert body["detail"]["reason"] == reason
+    """Section 6 gives each reason its own status, and the payload is a valid one.
+
+    A caller retries a timeout, escalates an unreachable host, and reports an
+    unparsable answer as a defect in the master. One shared 500 would hide the
+    difference. There is no `rule`: no section 4 rule ran, so attributing the
+    refusal to one would be a lie about why the request failed.
+    """
+
+    client = TestClient(
+        create_app(
+            policy_client=StubPolicyClient(fail_with=reason),
+            repository=repository,
+        )
+    )
+    body = _assert_refusal(
+        _post(client, VALID["VALID-01"]),
+        status=status,
+        code="POLICY_LOOKUP_FAILED",
+        rule=None,
+    )
+    assert body["detail"] == {"reason": reason}
