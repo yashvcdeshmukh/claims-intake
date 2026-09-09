@@ -1,0 +1,17 @@
+.venv/
+.git/
+.github/
+.devcontainer/
+.worktrees/
+tests/
+docs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+*.env
+.DS_Store
+README.md
+.gitignore
